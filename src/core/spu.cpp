@@ -208,15 +208,13 @@ struct ADPCMBlock
   u8 data[NUM_SAMPLES_PER_ADPCM_BLOCK / 2];
 
   // For both 4bit and 8bit ADPCM, reserved shift values 13..15 will act same as shift=9).
-  u8 GetShift() const
+  ALWAYS_INLINE u8 GetShift() const
   {
     const u8 shift = shift_filter.shift;
     return (shift > 12) ? 9 : shift;
   }
 
-  u8 GetFilter() const { return shift_filter.filter; }
-
-  u8 GetNibble(u32 index) const { return (data[index / 2] >> ((index % 2) * 4)) & 0x0F; }
+  ALWAYS_INLINE u8 GetFilter() const { return shift_filter.filter; }
 };
 
 struct VolumeEnvelope
@@ -347,11 +345,12 @@ static bool CheckRAMIRQ(u32 address);
 static void TriggerRAMIRQ();
 static void CheckForLateRAMIRQs();
 
-static void WriteToCaptureBuffer(u32 index, s16 value);
-static void IncrementCaptureBufferPosition();
+static void WriteToCaptureBuffers(s16 cd_left, s16 cd_right, s16 voice_1, s16 voice_3);
 
 static void ReadADPCMBlock(u16 address, ADPCMBlock* block);
-static std::tuple<s32, s32> SampleVoice(u32 voice_index);
+static std::tuple<s32, s32> SampleVoice(Voice& voice, u32 voice_index, bool noise_enabled,
+                                        bool pitch_modulation_enabled, bool irq9_enabled,
+                                        s32 previous_voice_last_volume);
 
 static void UpdateNoise();
 
@@ -1352,22 +1351,27 @@ void SPU::CheckForLateRAMIRQs()
   }
 }
 
-void SPU::WriteToCaptureBuffer(u32 index, s16 value)
+void SPU::WriteToCaptureBuffers(s16 cd_left, s16 cd_right, s16 voice_1, s16 voice_3)
 {
-  const u32 ram_address = (index * CAPTURE_BUFFER_SIZE_PER_CHANNEL) | ZeroExtend16(s_state.capture_buffer_position);
-  // Log_DebugFmt("write to capture buffer {} (0x{:08X}) <- 0x{:04X}", index, ram_address, u16(value));
-  std::memcpy(&s_ram[ram_address], &value, sizeof(value));
-  if (IsRAMIRQTriggerable() && CheckRAMIRQ(ram_address))
-  {
-    DEBUG_LOG("Trigger IRQ @ {:08X} ({:04X}) from capture buffer", ram_address, ram_address / 8);
-    TriggerRAMIRQ();
-  }
-}
+  const std::array<s16, 4> values = {cd_left, cd_right, voice_1, voice_3};
+  const u32 position = ZeroExtend16(s_state.capture_buffer_position);
+  const u32 irq_address = ZeroExtend32(s_state.irq_address) * 8;
+  bool irq_triggerable = IsRAMIRQTriggerable();
 
-void SPU::IncrementCaptureBufferPosition()
-{
-  s_state.capture_buffer_position += sizeof(s16);
-  s_state.capture_buffer_position %= CAPTURE_BUFFER_SIZE_PER_CHANNEL;
+  for (u32 index = 0; index < values.size(); index++)
+  {
+    const u32 ram_address = (index * CAPTURE_BUFFER_SIZE_PER_CHANNEL) | position;
+    // DEBUG_LOG("write to capture buffer {} (0x{:08X}) <- 0x{:04X}", index, ram_address, u16(values[index]));
+    std::memcpy(&s_ram[ram_address], &values[index], sizeof(values[index]));
+    if (irq_triggerable && irq_address == ram_address)
+    {
+      DEBUG_LOG("Trigger IRQ @ {:08X} ({:04X}) from capture buffer", ram_address, ram_address / 8);
+      TriggerRAMIRQ();
+      irq_triggerable = false;
+    }
+  }
+
+  s_state.capture_buffer_position = (position + sizeof(s16)) & (CAPTURE_BUFFER_SIZE_PER_CHANNEL - 1);
   s_state.SPUSTAT.second_half_capture_buffer = s_state.capture_buffer_position >= (CAPTURE_BUFFER_SIZE_PER_CHANNEL / 2);
 }
 
@@ -1921,25 +1925,40 @@ void SPU::Voice::DecodeBlock(const ADPCMBlock& block)
   const u8 filter_index = block.GetFilter();
   const s32 filter_pos = filter_table_pos[filter_index];
   const s32 filter_neg = filter_table_neg[filter_index];
-  s16 last_samples[2] = {adpcm_last_samples[0], adpcm_last_samples[1]};
+  s32 last_sample_0 = adpcm_last_samples[0];
+  s32 last_sample_1 = adpcm_last_samples[1];
+  s16* output = &current_block_samples[NUM_SAMPLES_FROM_LAST_ADPCM_BLOCK];
 
-  // samples
-  for (u32 i = 0; i < NUM_SAMPLES_PER_ADPCM_BLOCK; i++)
+  // decode pairs of nibbles on each iteration instead of alternating
+  for (u32 i = 0; i < static_cast<u32>(std::size(block.data)); i++)
   {
-    // extend 4-bit to 16-bit, apply shift from header and mix in previous samples
-    s32 sample = s32(static_cast<s16>(ZeroExtend16(block.GetNibble(i)) << 12) >> shift);
-    sample += (last_samples[0] * filter_pos) >> 6;
-    sample += (last_samples[1] * filter_neg) >> 6;
+    const u8 data = block.data[i];
 
-    last_samples[1] = last_samples[0];
-    current_block_samples[NUM_SAMPLES_FROM_LAST_ADPCM_BLOCK + i] = last_samples[0] = static_cast<s16>(Clamp16(sample));
+    // extend 4-bit to 16-bit, apply shift from header and mix in previous samples
+    // this is interleaved and whacky to try to maximize instruction-level parallelism, but basically, it's:
+    // s32(static_cast<s16>(ZeroExtend16(block.GetNibble(i)) << 12) >> shift) +
+    //   (last_samples[0] * filter_pos) >> 6
+    //   (last_samples[1] * filter_neg) >> 6
+    s32 s0 = static_cast<s32>(static_cast<s16>(ZeroExtend16(data & 0x0F) << 12) >> shift);
+    s32 s1 = static_cast<s32>(static_cast<s16>(ZeroExtend16(data >> 4) << 12) >> shift);
+    s0 += (last_sample_0 * filter_pos) >> 6;
+    s1 += (last_sample_0 * filter_neg) >> 6;
+    s0 += (last_sample_1 * filter_neg) >> 6;
+    s0 = Clamp16(s0);
+    s1 += (s0 * filter_pos) >> 6;
+    s1 = Clamp16(s1);
+
+    *(output++) = Truncate16(last_sample_1 = s0);
+    *(output++) = Truncate16(last_sample_0 = s1);
   }
 
-  std::copy(last_samples, last_samples + countof(last_samples), adpcm_last_samples.begin());
+  adpcm_last_samples[0] = Truncate16(last_sample_0);
+  adpcm_last_samples[1] = Truncate16(last_sample_1);
+
   current_block_flags.bits = block.flags.bits;
 }
 
-s32 SPU::Voice::Interpolate() const
+static constexpr std::array<std::array<s16, 4>, 0x100> GenerateInterpolationCoefficients()
 {
   static constexpr std::array<s16, 0x200> gauss = {{
     -0x001, -0x001, -0x001, -0x001, -0x001, -0x001, -0x001, -0x001, //
@@ -2008,14 +2027,23 @@ s32 SPU::Voice::Interpolate() const
     0x5997, 0x599E, 0x59A4, 0x59A9, 0x59AD, 0x59B0, 0x59B2, 0x59B3  //
   }};
 
+  std::array<std::array<s16, 4>, 0x100> ret = {};
+  for (u32 phase = 0; phase < ret.size(); phase++)
+    ret[phase] = {gauss[0x0FF - phase], gauss[0x1FF - phase], gauss[0x100 + phase], gauss[phase]};
+  return ret;
+}
+
+s32 SPU::Voice::Interpolate() const
+{
+  static constexpr std::array<std::array<s16, 4>, 0x100> coefficients = GenerateInterpolationCoefficients();
+
   const u8 i = counter.interpolation_index;
   const u32 s = NUM_SAMPLES_FROM_LAST_ADPCM_BLOCK + ZeroExtend32(counter.sample_index.GetValue());
+  const GSVector4i samples = GSVector4i::loadl<false>(&current_block_samples[s - 3]);
+  const GSVector4i weights = GSVector4i::loadl<false>(coefficients[i].data());
 
-  s32 out = s32(gauss[0x0FF - i]) * s32(current_block_samples[s - 3]);
-  out += s32(gauss[0x1FF - i]) * s32(current_block_samples[s - 2]);
-  out += s32(gauss[0x100 + i]) * s32(current_block_samples[s - 1]);
-  out += s32(gauss[0x000 + i]) * s32(current_block_samples[s - 0]);
-  return out >> 15;
+  // Only the lower half is used, so we can do a 64-bit reduction instead of 128-bit.
+  return (samples.madd_s16(weights).xy().addv_s32() >> 15);
 }
 
 void SPU::ReadADPCMBlock(u16 address, ADPCMBlock* block)
@@ -2045,10 +2073,11 @@ void SPU::ReadADPCMBlock(u16 address, ADPCMBlock* block)
   }
 }
 
-ALWAYS_INLINE_RELEASE std::tuple<s32, s32> SPU::SampleVoice(u32 voice_index)
+ALWAYS_INLINE_RELEASE std::tuple<s32, s32> SPU::SampleVoice(Voice& voice, u32 voice_index, bool noise_enabled,
+                                                            bool pitch_modulation_enabled, bool irq9_enabled,
+                                                            s32 previous_voice_last_volume)
 {
-  Voice& voice = s_state.voices[voice_index];
-  if (!voice.IsOn() && !s_state.SPUCNT.irq9_enable)
+  if (!voice.IsOn() && !irq9_enabled)
   {
     voice.last_volume = 0;
 
@@ -2083,7 +2112,7 @@ ALWAYS_INLINE_RELEASE std::tuple<s32, s32> SPU::SampleVoice(u32 voice_index)
   {
     // interpolate/sample and apply ADSR volume
     s32 sample;
-    if (IsVoiceNoiseEnabled(voice_index))
+    if (noise_enabled)
       sample = GetVoiceNoiseLevel();
     else
       sample = voice.Interpolate();
@@ -2102,9 +2131,9 @@ ALWAYS_INLINE_RELEASE std::tuple<s32, s32> SPU::SampleVoice(u32 voice_index)
 
   // Pitch modulation
   u16 step = voice.regs.adpcm_sample_rate;
-  if (IsPitchModulationEnabled(voice_index))
+  if (pitch_modulation_enabled)
   {
-    const s32 factor = std::clamp<s32>(s_state.voices[voice_index - 1].last_volume, -0x8000, 0x7FFF) + 0x8000;
+    const s32 factor = std::clamp<s32>(previous_voice_last_volume, -0x8000, 0x7FFF) + 0x8000;
     step = Truncate16(static_cast<u32>((SignExtend32(step) * factor) >> 15));
   }
   step = std::min<u16>(step, 0x3FFF);
@@ -2132,7 +2161,7 @@ ALWAYS_INLINE_RELEASE std::tuple<s32, s32> SPU::SampleVoice(u32 voice_index)
       if (!voice.current_block_flags.loop_repeat)
       {
         // End+Mute flags are ignored when noise is enabled. ADPCM data is still decoded.
-        if (!IsVoiceNoiseEnabled(voice_index))
+        if (!noise_enabled)
         {
           TRACE_LOG("Voice {} loop end+mute @ 0x{:04X}", voice_index, voice.current_address);
           voice.ForceOff();
@@ -2429,11 +2458,18 @@ void SPU::Execute(void* param, TickCount ticks)
       s32 reverb_in_left = 0;
       s32 reverb_in_right = 0;
 
+      u32 noise_mode = s_state.noise_mode_register;
+      u32 pitch_modulation_enable = s_state.pitch_modulation_enable_register & ~1u;
       u32 reverb_on_register = s_state.reverb_on_register;
+      s32 previous_voice_last_volume = 0;
+      const bool irq9_enabled = s_state.SPUCNT.irq9_enable;
 
-      for (u32 voice = 0; voice < NUM_VOICES; voice++)
+      u32 voice_index = 0;
+      for (Voice& voice : s_state.voices)
       {
-        const auto [left, right] = SampleVoice(voice);
+        const auto [left, right] =
+          SampleVoice(voice, voice_index, ConvertToBoolUnchecked(noise_mode & 1u),
+                      ConvertToBoolUnchecked(pitch_modulation_enable & 1u), irq9_enabled, previous_voice_last_volume);
         left_sum += left;
         right_sum += right;
 
@@ -2442,7 +2478,11 @@ void SPU::Execute(void* param, TickCount ticks)
           reverb_in_left += left;
           reverb_in_right += right;
         }
+        previous_voice_last_volume = voice.last_volume;
+        noise_mode >>= 1;
+        pitch_modulation_enable >>= 1;
         reverb_on_register >>= 1;
+        voice_index++;
       }
 
       if (!s_state.SPUCNT.mute_n)
@@ -2505,11 +2545,8 @@ void SPU::Execute(void* param, TickCount ticks)
       s_state.main_volume_right.Tick();
 
       // Write to capture buffers.
-      WriteToCaptureBuffer(0, cd_audio_left);
-      WriteToCaptureBuffer(1, cd_audio_right);
-      WriteToCaptureBuffer(2, static_cast<s16>(Clamp16(s_state.voices[1].last_volume)));
-      WriteToCaptureBuffer(3, static_cast<s16>(Clamp16(s_state.voices[3].last_volume)));
-      IncrementCaptureBufferPosition();
+      WriteToCaptureBuffers(cd_audio_left, cd_audio_right, static_cast<s16>(Clamp16(s_state.voices[1].last_volume)),
+                            static_cast<s16>(Clamp16(s_state.voices[3].last_volume)));
 
       // Key off/on voices after the first frame.
       if (i == 0 && (s_state.key_off_register != 0 || s_state.key_on_register != 0))
